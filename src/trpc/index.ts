@@ -3,6 +3,7 @@ import { getKindeServerSession } from "@kinde-oss/kinde-auth-nextjs/server";
 import { TRPCError } from "@trpc/server";
 import { db } from "@/db";
 import { z } from "zod";
+import { INFINITE_QUERY_LIMIT } from "@/config/infinite-query";
 
 export const appRouter = router({
   authCallback: publicProcedure.query(async () => {
