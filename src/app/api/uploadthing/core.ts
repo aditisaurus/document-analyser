@@ -3,11 +3,9 @@ import { getKindeServerSession } from "@kinde-oss/kinde-auth-nextjs/server";
 import { createUploadthing, type FileRouter } from "uploadthing/next";
 
 import { PDFLoader } from "langchain/document_loaders/fs/pdf";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { getPineconeClient } from "@/lib/pinecone";
-import { getUserSubscriptionPlan } from "@/lib/stripe";
-import { PLANS } from "@/config/stripe";
+import { CustomOpenAIEmbeddings } from "@/lib/custom-embeddings";
 
 const f = createUploadthing();
 
@@ -17,9 +15,7 @@ const middleware = async () => {
 
   if (!user || !user.id) throw new Error("Unauthorized");
 
-  const subscriptionPlan = await getUserSubscriptionPlan();
-
-  return { userId: user.id, subscriptionPlan };
+  return { userId: user.id };
 };
 
 const onUploadComplete = async ({
@@ -33,136 +29,115 @@ const onUploadComplete = async ({
     url: string;
   };
 }) => {
-  console.log("=== UPLOAD COMPLETE CALLBACK STARTED ===");
-  console.log("File details:", file);
-  console.log("Metadata:", metadata);
+  console.log("🚀 Upload complete callback started");
+  console.log("📁 File details:", file);
+  console.log("👤 User ID:", metadata.userId);
 
-  const isFileExist = await db.file.findFirst({
-    where: {
-      key: file.key,
-    },
-  });
-
-  if (isFileExist) {
-    console.log("File already exists in database");
-    return;
-  }
-
-  // CREATE THE DATABASE RECORD
-  const createdFile = await db.file.create({
-    data: {
-      key: file.key,
-      name: file.name,
-      userId: metadata.userId,
-      url: file.url,
-      uploadStatus: "PROCESSING",
-    },
-  });
-
-  console.log("Created file record:", createdFile);
+  let createdFile: any = null; // Declare outside try block
 
   try {
-    console.log("Starting PDF processing...");
+    const isFileExist = await db.file.findFirst({
+      where: {
+        key: file.key,
+      },
+    });
 
-    // Try multiple approaches to fetch the file
-    let blob: Blob;
-
-    try {
-      // First try: Direct fetch with proper headers
-      const response = await fetch(file.url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; PDF-Processor/1.0)",
-          Accept: "application/pdf,*/*",
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      blob = await response.blob();
-      console.log("File downloaded successfully, size:", blob.size);
-    } catch (fetchError) {
-      console.error("Direct fetch failed:", fetchError);
-
-      // Fallback: Try constructing the S3 URL manually (sometimes UploadThing URLs have issues)
-      const s3Url = `https://uploadthing-prod.s3.us-west-2.amazonaws.com/${file.key}`;
-      console.log("Trying S3 URL:", s3Url);
-
-      const s3Response = await fetch(s3Url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; PDF-Processor/1.0)",
-          Accept: "application/pdf,*/*",
-        },
-      });
-
-      if (!s3Response.ok) {
-        throw new Error(
-          `S3 fetch failed: ${s3Response.status} ${s3Response.statusText}`
-        );
-      }
-
-      blob = await s3Response.blob();
-      console.log("File downloaded from S3, size:", blob.size);
+    if (isFileExist) {
+      console.log("⚠️ File already exists");
+      return;
     }
 
-    // Validate that we got a PDF
-    if (
-      !blob.type.includes("pdf") &&
-      blob.type !== "application/octet-stream"
-    ) {
-      console.warn("File type is not PDF:", blob.type);
+    console.log("💾 Creating database record...");
+    createdFile = await db.file.create({
+      data: {
+        key: file.key,
+        name: file.name,
+        userId: metadata.userId,
+        url: file.url,
+        uploadStatus: "PROCESSING",
+      },
+    });
+
+    console.log("✅ Created file record:", createdFile.id);
+
+    // Step 1: Validate environment variables
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("OPENAI_API_KEY is not configured");
     }
 
+    if (!process.env.PINECONE_API_KEY) {
+      throw new Error("PINECONE_API_KEY is not configured");
+    }
+
+    console.log("✅ Environment variables validated");
+
+    // Step 2: Fetch and load PDF
+    console.log("📄 Fetching PDF from:", file.url);
+    const response = await fetch(file.url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch file: ${response.status} ${response.statusText}`
+      );
+    }
+
+    const blob = await response.blob();
+    console.log("✅ File downloaded, size:", blob.size, "bytes");
+
+    // Step 3: Parse PDF
+    console.log("📖 Loading PDF with LangChain...");
     const loader = new PDFLoader(blob);
     const pageLevelDocs = await loader.load();
     const pagesAmt = pageLevelDocs.length;
 
-    console.log("PDF loaded successfully, pages:", pagesAmt);
+    console.log("✅ PDF loaded successfully, pages:", pagesAmt);
+    console.log(
+      "📄 Sample content:",
+      pageLevelDocs[0]?.pageContent?.substring(0, 100) + "..."
+    );
 
-    const { subscriptionPlan } = metadata;
-    const { isSubscribed } = subscriptionPlan;
+    // Step 4: Initialize embeddings with CustomOpenAIEmbeddings
+    console.log("🧠 Initializing OpenAI embeddings...");
+    const embeddings = new CustomOpenAIEmbeddings({
+      openAIApiKey: process.env.OPENAI_API_KEY,
+      modelName: "text-embedding-3-small",
+      dimensions: 1024, // Match your Pinecone index
+    });
 
-    const isProExceeded =
-      pagesAmt > PLANS.find((plan) => plan.name === "Pro")!.pagesPerPdf;
-    const isFreeExceeded =
-      pagesAmt > PLANS.find((plan) => plan.name === "Free")!.pagesPerPdf;
+    // Step 5: Initialize Pinecone
+    console.log("📌 Initializing Pinecone...");
+    const pinecone = await getPineconeClient();
 
-    if ((isSubscribed && isProExceeded) || (!isSubscribed && isFreeExceeded)) {
+    const indexName = "quill";
+    console.log("🔍 Using Pinecone index:", indexName);
+
+    const pineconeIndex = pinecone.Index(indexName);
+
+    // Step 6: Test Pinecone connection
+    try {
+      const indexStats = await pineconeIndex.describeIndexStats();
       console.log(
-        `Page limit exceeded: ${pagesAmt} pages, isSubscribed: ${isSubscribed}`
+        "✅ Pinecone connection successful, index stats:",
+        indexStats
       );
-
-      await db.file.update({
-        data: {
-          uploadStatus: "FAILED",
-        },
-        where: {
-          id: createdFile.id,
-        },
-      });
-
-      // Don't throw an error here, just return - the client will handle the FAILED status
-      return { fileId: createdFile.id, error: "PAGE_LIMIT_EXCEEDED" };
+    } catch (pineconeError) {
+      console.error("❌ Pinecone connection failed:", pineconeError);
+      throw new Error(`Pinecone connection failed: ${pineconeError.message}`);
     }
 
-    console.log("Page limit check passed, starting vectorization...");
-
-    // vectorize and index entire document
-    const pinecone = await getPineconeClient();
-    const pineconeIndex = pinecone.Index("document-analyser");
-
-    const embeddings = new OpenAIEmbeddings({
-      openAIApiKey: process.env.OPENAI_API_KEY,
-    });
+    // Step 7: Vectorize and store
+    console.log("🧮 Starting vectorization process...");
+    console.log("📊 Processing", pageLevelDocs.length, "document chunks");
 
     await PineconeStore.fromDocuments(pageLevelDocs, embeddings, {
       pineconeIndex,
       namespace: createdFile.id,
+      textKey: "text",
     });
 
-    console.log("Vectorization complete, updating status to SUCCESS");
+    console.log("✅ Vectorization completed successfully");
 
+    // Step 8: Mark as successful
     await db.file.update({
       data: {
         uploadStatus: "SUCCESS",
@@ -172,28 +147,29 @@ const onUploadComplete = async ({
       },
     });
 
-    console.log("=== UPLOAD COMPLETE CALLBACK FINISHED SUCCESSFULLY ===");
-  } catch (err) {
-    console.error("=== ERROR IN UPLOAD COMPLETE CALLBACK ===", err);
-
-    // More detailed error logging
-    if (err instanceof Error) {
-      console.error("Error name:", err.name);
-      console.error("Error message:", err.message);
-      console.error("Error stack:", err.stack);
-    }
-
-    await db.file.update({
-      data: {
-        uploadStatus: "FAILED",
-      },
-      where: {
-        id: createdFile.id,
-      },
+    console.log(
+      "🎉 File processing completed successfully with full vectorization"
+    );
+  } catch (error) {
+    console.error("❌ Error during file processing:", error);
+    console.error("Error details:", {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
     });
-  }
 
-  return { fileId: createdFile.id };
+    // Update file status to failed (only if createdFile exists)
+    if (createdFile) {
+      await db.file.update({
+        data: {
+          uploadStatus: "FAILED",
+        },
+        where: {
+          id: createdFile.id,
+        },
+      });
+    }
+  }
 };
 
 export const ourFileRouter = {

@@ -1,4 +1,3 @@
-import { privateProcedure, publicProcedure, router } from "./trpc";
 import { getKindeServerSession } from "@kinde-oss/kinde-auth-nextjs/server";
 import { TRPCError } from "@trpc/server";
 import { db } from "@/db";
@@ -7,6 +6,7 @@ import { INFINITE_QUERY_LIMIT } from "@/config/infinite-query";
 import { getUserSubscriptionPlan, stripe } from "@/lib/stripe";
 import { PLANS } from "@/config/stripe";
 import { absoluteUrl } from "@/lib/utils";
+import { privateProcedure, publicProcedure, router } from "@/trpc/trpc";
 
 export const appRouter = router({
   authCallback: publicProcedure.query(async () => {
@@ -18,13 +18,13 @@ export const appRouter = router({
     if (!user.id || !user.email) throw new TRPCError({ code: "UNAUTHORIZED" });
 
     //check if user is in db
-    const dbUSer = await db.user.findFirst({
+    const dbUser = await db.user.findFirst({
       where: {
         id: user.id,
       },
     });
 
-    if (!dbUSer) {
+    if (!dbUser) {
       await db.user.create({
         data: {
           id: user.id,
@@ -35,6 +35,7 @@ export const appRouter = router({
 
     return { success: true };
   }),
+
   createStripeSession: privateProcedure.mutation(async ({ ctx }) => {
     const { userId } = ctx;
 
@@ -87,6 +88,9 @@ export const appRouter = router({
     return await db.file.findMany({
       where: {
         userId,
+      },
+      orderBy: {
+        createdAt: "desc",
       },
     });
   }),
@@ -192,9 +196,66 @@ export const appRouter = router({
         },
       });
 
+      console.log(
+        "getFileUploadStatus - File found:",
+        file
+          ? {
+              id: file.id,
+              name: file.name,
+              uploadStatus: file.uploadStatus,
+              createdAt: file.createdAt,
+            }
+          : "No file found"
+      );
+
       if (!file) return { status: "PENDING" as const };
 
       return { status: file.uploadStatus };
+    }),
+
+  // Add this new procedure to get detailed file info for debugging
+  getFileDetails: privateProcedure
+    .input(z.object({ fileId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const file = await db.file.findFirst({
+        where: {
+          id: input.fileId,
+          userId: ctx.userId,
+        },
+      });
+
+      if (!file) throw new TRPCError({ code: "NOT_FOUND" });
+
+      return {
+        ...file,
+        // Add any additional debugging info you need
+      };
+    }),
+
+  // Add procedure to retry file processing
+  retryFileProcessing: privateProcedure
+    .input(z.object({ fileId: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const file = await db.file.findFirst({
+        where: {
+          id: input.fileId,
+          userId: ctx.userId,
+        },
+      });
+
+      if (!file) throw new TRPCError({ code: "NOT_FOUND" });
+
+      // Reset the file status to trigger reprocessing
+      const updatedFile = await db.file.update({
+        where: {
+          id: input.fileId,
+        },
+        data: {
+          uploadStatus: "PROCESSING",
+        },
+      });
+
+      return updatedFile;
     }),
 });
 

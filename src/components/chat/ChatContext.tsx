@@ -28,61 +28,99 @@ export const ChatContextProvider = ({ fileId, children }: Props) => {
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
   const utils = trpc.useContext();
-
   const backupMessage = useRef("");
+
+  console.log("📂 ChatContextProvider initialized for fileId:", fileId);
 
   const { mutate: sendMessage } = useMutation({
     mutationFn: async ({ message }: { message: string }) => {
+      console.log("📤 Sending message:", message);
+
       const response = await fetch("/api/message", {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           fileId,
           message,
         }),
       });
 
+      console.log("📡 Response status:", response);
+
       if (!response.ok) {
-        throw new Error("Failed to send message");
+        const errorText = await response.text();
+        console.error("❌ Response error:", errorText);
+        throw new Error(
+          `Failed to send message: ${response.status} ${response.statusText}`
+        );
       }
 
       return response.body;
     },
     onMutate: async ({ message }) => {
+      console.log("🚀 Mutation started for message:", message);
+
       backupMessage.current = message;
       setMessage("");
 
-      // step 1
+      // Cancel any outgoing requests
       await utils.getFileMessages.cancel();
 
-      // step 2
+      // Get the current messages
       const previousMessages = utils.getFileMessages.getInfiniteData();
 
-      // step 3
+      // Optimistically update the cache
       utils.getFileMessages.setInfiniteData(
         { fileId, limit: INFINITE_QUERY_LIMIT },
         (old) => {
           if (!old) {
             return {
-              pages: [],
-              pageParams: [],
+              pages: [
+                {
+                  messages: [
+                    {
+                      createdAt: new Date().toISOString(),
+                      id: crypto.randomUUID(),
+                      text: message,
+                      isUserMessage: true,
+                    },
+                  ],
+                  nextCursor: undefined,
+                },
+              ],
+              pageParams: [undefined],
             };
           }
 
           let newPages = [...old.pages];
+          let latestPage = newPages[0];
 
-          let latestPage = newPages[0]!;
-
-          latestPage.messages = [
-            {
-              createdAt: new Date().toISOString(),
-              id: crypto.randomUUID(),
-              text: message,
-              isUserMessage: true,
-            },
-            ...latestPage.messages,
-          ];
-
-          newPages[0] = latestPage;
+          if (latestPage) {
+            latestPage.messages = [
+              {
+                createdAt: new Date().toISOString(),
+                id: crypto.randomUUID(),
+                text: message,
+                isUserMessage: true,
+              },
+              ...latestPage.messages,
+            ];
+          } else {
+            // If no pages exist, create the first page
+            newPages[0] = {
+              messages: [
+                {
+                  createdAt: new Date().toISOString(),
+                  id: crypto.randomUUID(),
+                  text: message,
+                  isUserMessage: true,
+                },
+              ],
+              nextCursor: undefined,
+            };
+          }
 
           return {
             ...old,
@@ -99,9 +137,11 @@ export const ChatContextProvider = ({ fileId, children }: Props) => {
       };
     },
     onSuccess: async (stream) => {
+      console.log("✅ Message sent successfully, processing stream...");
       setIsLoading(false);
 
       if (!stream) {
+        console.error("❌ No stream received");
         return toast.error(
           "There was a problem sending this message. Please refresh this page and try again."
         );
@@ -110,79 +150,118 @@ export const ChatContextProvider = ({ fileId, children }: Props) => {
       const reader = stream.getReader();
       const decoder = new TextDecoder();
       let done = false;
-
-      // accumulated response
       let accResponse = "";
 
-      while (!done) {
-        const { value, done: doneReading } = await reader.read();
-        done = doneReading;
-        const chunkValue = decoder.decode(value);
+      try {
+        while (!done) {
+          const { value, done: doneReading } = await reader.read();
+          done = doneReading;
 
-        accResponse += chunkValue;
+          if (value) {
+            const chunkValue = decoder.decode(value);
+            accResponse += chunkValue;
 
-        // append chunk to the actual message
+            // Update the AI response in real-time
+            utils.getFileMessages.setInfiniteData(
+              { fileId, limit: INFINITE_QUERY_LIMIT },
+              (old) => {
+                if (!old) return { pages: [], pageParams: [] };
+
+                let isAiResponseCreated = old.pages.some((page) =>
+                  page.messages.some((message) => message.id === "ai-response")
+                );
+
+                let updatedPages = old.pages.map((page) => {
+                  if (page === old.pages[0]) {
+                    let updatedMessages;
+
+                    if (!isAiResponseCreated) {
+                      updatedMessages = [
+                        {
+                          createdAt: new Date().toISOString(),
+                          id: "ai-response",
+                          text: accResponse,
+                          isUserMessage: false,
+                        },
+                        ...page.messages,
+                      ];
+                    } else {
+                      updatedMessages = page.messages.map((message) => {
+                        if (message.id === "ai-response") {
+                          return {
+                            ...message,
+                            text: accResponse,
+                          };
+                        }
+                        return message;
+                      });
+                    }
+
+                    return {
+                      ...page,
+                      messages: updatedMessages,
+                    };
+                  }
+
+                  return page;
+                });
+
+                return { ...old, pages: updatedPages };
+              }
+            );
+          }
+        }
+
+        console.log("✅ Stream processing completed");
+      } catch (streamError) {
+        console.error("❌ Error processing stream:", streamError);
+        toast.error("Error processing response. Please try again.");
+      }
+    },
+    onError: (error, variables, context) => {
+      console.error("❌ Mutation error:", error);
+
+      setMessage(backupMessage.current);
+      setIsLoading(false);
+
+      // Restore previous messages
+      if (context?.previousMessages) {
         utils.getFileMessages.setInfiniteData(
           { fileId, limit: INFINITE_QUERY_LIMIT },
           (old) => {
-            if (!old) return { pages: [], pageParams: [] };
+            if (!old) {
+              return {
+                pages: [
+                  {
+                    messages: context.previousMessages,
+                    nextCursor: undefined,
+                  },
+                ],
+                pageParams: [undefined],
+              };
+            }
 
-            let isAiResponseCreated = old.pages.some((page) =>
-              page.messages.some((message) => message.id === "ai-response")
-            );
-
-            let updatedPages = old.pages.map((page) => {
-              if (page === old.pages[0]) {
-                let updatedMessages;
-
-                if (!isAiResponseCreated) {
-                  updatedMessages = [
-                    {
-                      createdAt: new Date().toISOString(),
-                      id: "ai-response",
-                      text: accResponse,
-                      isUserMessage: false,
-                    },
-                    ...page.messages,
-                  ];
-                } else {
-                  updatedMessages = page.messages.map((message) => {
-                    if (message.id === "ai-response") {
-                      return {
-                        ...message,
-                        text: accResponse,
-                      };
-                    }
-                    return message;
-                  });
+            return {
+              ...old,
+              pages: old.pages.map((page, index) => {
+                if (index === 0) {
+                  return {
+                    ...page,
+                    messages: context.previousMessages,
+                  };
                 }
-
-                return {
-                  ...page,
-                  messages: updatedMessages,
-                };
-              }
-
-              return page;
-            });
-
-            return { ...old, pages: updatedPages };
+                return page;
+              }),
+            };
           }
         );
       }
-    },
 
-    onError: (_, __, context) => {
-      setMessage(backupMessage.current);
-      utils.getFileMessages.setData(
-        { fileId },
-        { messages: context?.previousMessages ?? [] }
-      );
       toast.error("Something went wrong. Please try again.");
     },
     onSettled: async () => {
+      console.log("🔄 Mutation settled, refreshing data...");
       setIsLoading(false);
-
       await utils.getFileMessages.invalidate({ fileId });
     },
   });
@@ -191,7 +270,20 @@ export const ChatContextProvider = ({ fileId, children }: Props) => {
     setMessage(e.target.value);
   };
 
-  const addMessage = () => sendMessage({ message });
+  const addMessage = () => {
+    if (!message.trim()) {
+      toast.error("Please enter a message");
+      return;
+    }
+
+    if (isLoading) {
+      toast.error("Please wait for the current message to complete");
+      return;
+    }
+
+    console.log("💬 Adding message:", message);
+    sendMessage({ message });
+  };
 
   return (
     <ChatContext.Provider

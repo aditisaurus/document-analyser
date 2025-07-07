@@ -3,6 +3,7 @@ import PdfRenderer from "@/components/PdfRenderer";
 import { db } from "@/db";
 import { getUserSubscriptionPlan } from "@/lib/stripe";
 import { getKindeServerSession } from "@kinde-oss/kinde-auth-nextjs/server";
+import { fi } from "date-fns/locale";
 import { notFound, redirect } from "next/navigation";
 
 interface PageProps {
@@ -26,11 +27,11 @@ const Page = async ({ params }: PageProps) => {
     },
   });
 
-  console.log("File details:", file);
-
   if (!file) notFound();
 
   const plan = await getUserSubscriptionPlan();
+
+  console.log(file, fileid, "FILE");
 
   return (
     <div className="flex-1 justify-between flex flex-col h-[calc(100vh-3.5rem)]">
